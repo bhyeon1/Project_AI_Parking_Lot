@@ -1,0 +1,204 @@
+##this is for entrance management  environment is RaspberryPi5, python3.11
+
+import cv2
+import warnings
+import torch
+import numpy as np
+import time
+from collections import Counter
+from PIL import Image, ImageDraw, ImageFont
+import easyocr
+import sys
+from gpiozero import DigitalOutputDevice, DigitalInputDevice
+
+YOLO_MODEL_PATH = "best_yolov5.pt"
+REGISTERED_PLATES = ["01가0785", "12나3456", "66로 3848", "57서 9757"]
+MIN_TEXT_LENGTH = 8
+
+GPIO_OUT_PIN = 17
+GPIO_IN_PIN = 27
+
+out_pin = DigitalOutputDevice(GPIO_OUT_PIN, initial_value = False)
+in_pin = DigitalInputDevice(GPIO_IN_PIN)
+
+out_pin.off()
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+cv2.namedWindow("YOLO + EasyOCR", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("YOLO + EasyOCR", 800, 600)
+cv2.namedWindow("등록 여부 안내", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("등록 여부 안내", 800, 200)
+
+font_path = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
+try:
+    font = ImageFont.truetype(font_path, 40)
+except:
+    font = ImageFont.load_default()
+
+def get_most_frequent_text(text_list, min_length):
+    filtered = [t for t in text_list if len(t) >= min_length]
+    if not filtered:
+        return "?"
+    return Counter(filtered).most_common(1)[0][0]
+
+def draw_text_pil(image, text, font, position, color=(0, 255, 0)):
+    img_pil = Image.fromarray(image)
+    draw = ImageDraw.Draw(img_pil)
+    draw.text(position, text, font=font, fill=color)
+    return np.array(img_pil)
+
+def send_pulse():
+    out_pin.on()
+    time.sleep(2)
+    out_pin.off()
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # YOLO 모델 로드 (device 지정 없이 로드, 내부적으로 처리됨)
+    yolo = torch.hub.load('ultralytics/yolov5', 'custom', path=YOLO_MODEL_PATH)
+    yolo.eval()
+
+    reader = easyocr.Reader(['ko'])
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("웹캠 열기 실패")
+        sys.exit(1)
+
+    state = "IDLE"
+    detection_time = 0
+    ocr_results = []
+    final_text = ""
+    result_msg = "번호판을 인식 대기중입니다..."
+    cropped_plate = None
+
+    ocr_start_time = 0
+    ocr_count = 0
+
+    print("Press 'q' to quit")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            if state == "IDLE":
+                results = yolo(rgb, size=160)
+                dets = results.xyxy[0].cpu().numpy()
+                for x1, y1, x2, y2, conf, cls in dets:
+                    if int(cls) == 0 and conf > 0.5:
+                        x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+                        cropped_plate = frame[y1:y2, x1:x2]
+                        detection_time = time.time()
+                        ocr_results = []
+                        final_text = ""
+                        result_msg = "번호판을 인식 중입니다..."
+                        state = "WAIT_OCR"
+                        print("📷 번호판 인식됨 → 5초 대기 시작")
+                        break
+
+            elif state == "WAIT_OCR":
+                if time.time() - detection_time >= 5:
+                    print("🔎 OCR 시작")
+                    state = "RUN_OCR"
+                    ocr_start_time = time.time()
+                    ocr_count = 0
+
+            elif state == "RUN_OCR":
+                current_time = time.time()
+                if ocr_count < 10 and current_time - ocr_start_time >= 0.5:
+                    ocr_start_time = current_time
+                    # 다시 번호판 검출해서 위치 확인 (optional, 생략 가능)
+                    results = yolo(rgb, size=160)
+                    dets = results.xyxy[0].cpu().numpy()
+                    detected = False
+                    for x1, y1, x2, y2, conf, cls in dets:
+                        if int(cls) == 0 and conf > 0.5:
+                            x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+                            cropped_plate = frame[y1:y2, x1:x2]
+                            text_result = reader.readtext(cropped_plate, detail=0)
+                            text = text_result[0] if text_result else "?"
+                            ocr_results.append(text)
+                            print(f"OCR 결과 {ocr_count + 1}/10: {text}")
+                            ocr_box = (x1, y1, x2, y2)
+                            ocr_text = text
+                            ocr_count += 1
+                            detected = True
+                            break
+                    if not detected:
+                        print("번호판 검출 실패, OCR 생략")
+                elif ocr_count >= 10:
+                    final_text = get_most_frequent_text(ocr_results, MIN_TEXT_LENGTH)
+                    print(f"✅ 최종 인식 문자열: {final_text}")
+                    if final_text in REGISTERED_PLATES:
+                        send_pulse()
+                        time.sleep(0.1)
+                        if in_pin.is_active:
+                            result_msg = f"{final_text} - 등록 차량이지만 만차입니다."
+                        else:
+                            result_msg = f"{final_text} - 등록된 차량입니다."
+                    else:
+                        result_msg = f"{final_text} - 미등록 차량입니다."
+                    print("📢", result_msg)
+                    state = "DONE_WAIT"
+                    done_time = time.time()
+
+            elif state == "DONE_WAIT":
+                if time.time() - done_time >= 5:
+                    state = "IDLE"
+                    result_msg = "번호판을 인식 대기중입니다..."
+                    final_text = ""
+                    print("🔁 다음 차량 대기 중 (IDLE 상태로 전환)")
+
+            # 영상 출력
+            pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_img)
+            if state in ["WAIT_OCR", "RUN_OCR", "DONE_WAIT"]:
+                draw.text((50, 50), final_text if final_text else "인식 중...", font=font, fill=(0, 255, 0))
+            if state == "RUN_OCR" and 'ocr_box' in locals() and 'ocr_text' in locals():
+                x1, y1, x2, y2 = ocr_box
+                draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=3)
+                draw.text((x1, y1 - 30), ocr_text, font=font, fill=(255, 0, 0))
+            frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            cv2.imshow("YOLO + EasyOCR", frame)
+
+            # 등록 여부 안내창
+            if state == "IDLE":
+                bg_color = (0, 0, 0)
+                text_color = (255, 0, 0)
+            elif "만차" in result_msg:
+                bg_color = (0, 255, 255)
+                text_color = (0, 0, 0)
+            elif "등록된" in result_msg:
+                bg_color = (0, 255, 0)
+                text_color = (0, 0, 0)
+            elif "미등록" in result_msg:
+                bg_color = (0, 0, 255)
+                text_color = (0, 0, 0)
+            else:
+                bg_color = (0, 0, 0)
+                text_color = (255, 255, 255)
+
+            result_image = np.full((200, 800, 3), bg_color, dtype=np.uint8)
+            result_image = draw_text_pil(result_image, result_msg, font, (30, 70), color=text_color)
+            cv2.imshow("등록 여부 안내", result_image)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        print("\n종료 중...")
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("리소스 정리 완료")
+
+if __name__ == "__main__":
+    main()
