@@ -100,8 +100,6 @@ python detect.py \
 
 ## 버전 호환성 (Colab 환경 기준)
 
-<img src="https://user-images.githubusercontent.com/your-id/680e1e45-2bcd-4e35-a73a-7be38e503987.png" width="600">
-
 - YOLO 모델은 `torch==2.1.0 + cu118`, `numpy==1.24.3` 환경에서 최적
 - OCR 모델은 `torch==2.6.0 + cu124`, `numpy==2.0.2` 기반
 - **서로 다른 CUDA 버전 사용으로 GPU 동시 운용 시 충돌 주의**
